@@ -205,3 +205,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# 1. Virtual Environment
+venv/
+env/
+
+# 2. Python Build/Cache Files
+__pycache__/
+*.pyc
+
+# 3. Dependencies/Packages
+*.egg-info/
+build/
+
+# 4. Large Data Files (Dlib Model)
+data/shape_predictor_68_face_landmarks.dat
+
+# 5. IDE/OS Files
+.DS_Store
+.vscode/
