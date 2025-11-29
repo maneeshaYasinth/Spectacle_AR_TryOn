@@ -3,6 +3,7 @@ import sys
 import dlib
 import os
 import numpy as np 
+import math
 
 # --- 1. Path Configuration and Model Loading ---
 
@@ -17,7 +18,7 @@ HAAR_CASCADE_PATH = os.path.join(
     SCRIPT_DIR, '..', 'data', 'cascades', 'haarcascade_frontalface_default.xml'
 )
 GLASSES_IMAGE_PATH = os.path.join(
-    SCRIPT_DIR, '..', 'data', 'spectacles.png' 
+    SCRIPT_DIR, '..', 'data', 'glasses.png' 
 )
 
 # Load the Dlib models with error handling
@@ -55,86 +56,141 @@ elif GLASSES_IMG.shape[2] == 3:
     alpha = np.ones(b.shape, dtype=b.dtype) * 255
     GLASSES_IMG = cv2.merge((b, g, r, alpha))
 
-# >>> NEW FIX: Flip the image vertically to correct upside-down orientation <<<
-GLASSES_IMG = cv2.flip(GLASSES_IMG, 0) 
+# NOTE: Keep the glasses image in its original orientation. If your
+# `spectacles.png` currently appears upside-down, replace the image
+# file with a corrected version or uncomment a rotation below to adjust.
+# (Previously flipped here; removed to avoid inverted overlay.)
+# Example alternatives you can try if needed:
+# GLASSES_IMG = cv2.flip(GLASSES_IMG, 1)           # horizontal flip
+# GLASSES_IMG = cv2.rotate(GLASSES_IMG, cv2.ROTATE_180)  # rotate 180 degrees
 # ---------------------------------------------------------------------
 
 
 # --- 2. Perspective Transformation Function ---
+# Global smoothing state for transform stability across frames
+SMOOTH_STATE = {
+    'M': None,           # last affine matrix (2x3)
+    'alpha': 0.45,       # smoothing factor (0-1), higher -> more smoothing
+}
+
 
 def overlay_glasses(frame, landmarks):
-    """Calculates perspective transform and overlays the glasses image onto the frame."""
-    
+    """Compute a similarity/affine transform from glasses source anchors to
+    eye/nose landmarks, apply temporal smoothing, and blend only inside the
+    non-zero warped alpha bbox for better performance and fewer artifacts.
+    """
+
+    # Work on a local copy of the glasses image to avoid modifying the
+    # global `GLASSES_IMG` and to prevent Python treating it as a local
+    # variable when we rotate it below.
+    glasses_img_local = GLASSES_IMG.copy()
     # 0. Separate the 4-channel image into BGR and Alpha (Mask)
-    glasses_bgr = GLASSES_IMG[:, :, :3]  # The BGR color data (first 3 channels)
-    glasses_mask = GLASSES_IMG[:, :, 3]   # The Alpha mask (the 4th channel)
+    glasses_bgr = glasses_img_local[:, :, :3].copy()
+    glasses_alpha = glasses_img_local[:, :, 3].copy()
 
-    # Convert the 1-channel mask to 3-channel for warping purposes (standard practice)
-    glasses_mask = cv2.cvtColor(glasses_mask, cv2.COLOR_GRAY2BGR)
-    
-    # 1. DEFINE SOURCE POINTS (Points on the original glasses PNG)
-    h, w, _ = GLASSES_IMG.shape
-    
-    # *** ADJUSTED SOURCE POINTS FOR BETTER ALIGNMENT ***
+    h, w = glasses_alpha.shape
+
+    # 1. Define 3 source anchor points on the glasses image (left, right, center)
+    #    These are empirical points that map to left-eye, right-eye, and nose.
     src_pts = np.float32([
-        [int(w * 0.18), int(h * 0.6)],    # Left Temple (Side of glasses)
-        [int(w * 0.82), int(h * 0.6)],    # Right Temple 
-        [int(w * 0.35), int(h * 0.75)],   # Left Eye area 
-        [int(w * 0.65), int(h * 0.75)]    # Right Eye area
+        [w * 0.18, h * 0.60],   # left temple
+        [w * 0.82, h * 0.60],   # right temple
+        [w * 0.50, h * 0.75],   # nose / lower-center
     ])
 
-    
-    # 2. DEFINE DESTINATION POINTS (Points on the user's face, based on landmarks)
-    points = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(0, 68)])
-    
+    # 2. Compute destination points from dlib landmarks: use eye centers and nose
+    pts = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(68)])
+
+    left_eye_center = pts[36:42].mean(axis=0)  # landmarks 36-41
+    right_eye_center = pts[42:48].mean(axis=0) # landmarks 42-47
+    nose_center = pts[27]                      # landmark 27 is bridge of nose
+
     dst_pts = np.float32([
-        points[1],   # Left Temple 
-        points[15],  # Right Temple
-        points[36],  # Left Eye Inner Corner
-        points[45]   # Right Eye Outer Corner
+        left_eye_center,
+        right_eye_center,
+        nose_center
     ])
-    
-    # 3. CALCULATE THE PERSPECTIVE MATRIX (Homography)
-    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    
-    # 4. WARP THE BGR IMAGE AND THE MASK SEPARATELY (The Key Fix!)
-    
-    # Warp the BGR content of the glasses
-    warped_bgr = cv2.warpPerspective(glasses_bgr, M, (frame.shape[1], frame.shape[0]))
-    
-    # Warp the 3-channel mask
-    warped_mask_3c = cv2.warpPerspective(glasses_mask, M, (frame.shape[1], frame.shape[0]))
-    
-    # 5. BLEND THE WARPED IMAGE ONTO THE FRAME
-    
-    # Convert the 3-channel mask back to 1-channel float for blending math
-    alpha_mask = cv2.cvtColor(warped_mask_3c, cv2.COLOR_BGR2GRAY) / 255.0
-    
-    # Since the mask might be blurry after warping, we sharpen it slightly
-    alpha_mask[alpha_mask > 0.9] = 1.0
-    alpha_mask[alpha_mask < 0.1] = 0.0
-    
-    alpha_mask_inv = 1.0 - alpha_mask
-    
-    # Ensure the alpha mask is a 3-channel array for element-wise multiplication
-    alpha_mask_3c = cv2.merge((alpha_mask, alpha_mask, alpha_mask))
-    alpha_mask_inv_3c = cv2.merge((alpha_mask_inv, alpha_mask_inv, alpha_mask_inv))
 
-    # Apply the blending formula (Foreground * Mask + Background * Inverse Mask)
-    # The warped BGR image is the foreground, and the current frame is the background.
-    
-    # Extract the region of interest (ROI) from the current frame
-    h_w, w_w, _ = warped_bgr.shape
-    roi = frame[0:h_w, 0:w_w]
+    # 3. Estimate a partial affine (similarity-like) transform from src->dst
+    #    cv2.estimateAffinePartial2D maps src to dst (src,dst)
+    M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
 
-    # Calculate the blended result
-    foreground = cv2.multiply(warped_bgr.astype(float), alpha_mask_3c)
-    background = cv2.multiply(roi.astype(float), alpha_mask_inv_3c)
-    
-    blended_result = cv2.add(foreground, background)
-    
-    # Copy the blended result back to the original frame
-    frame[0:h_w, 0:w_w] = blended_result.astype(np.uint8)
+    if M is None:
+        # If failed, don't modify frame
+        return frame
+
+    # 3b. Auto-correct if the estimated rotation is close to upside-down
+    #     Compute rotation angle from affine matrix. If it's > 90 degrees
+    #     (i.e. image is likely upside-down), rotate the source image 180
+    #     degrees and re-estimate the affine transform.
+    try:
+        angle_deg = math.degrees(math.atan2(M[0,1], M[0,0]))
+    except Exception:
+        angle_deg = 0.0
+
+    if abs(angle_deg) > 90:
+        # Rotate the local copy by 180 degrees to correct upside-down images
+        glasses_img_local = cv2.rotate(glasses_img_local, cv2.ROTATE_180)
+
+        # Recompute local copies and source anchors after rotation
+        glasses_bgr = glasses_img_local[:, :, :3].copy()
+        glasses_alpha = glasses_img_local[:, :, 3].copy()
+        h, w = glasses_alpha.shape
+        src_pts = np.float32([
+            [w * 0.18, h * 0.60],   # left temple
+            [w * 0.82, h * 0.60],   # right temple
+            [w * 0.50, h * 0.75],   # nose / lower-center
+        ])
+
+        # Re-estimate the affine transform with the corrected source
+        M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+
+        # If still None, bail out gracefully
+        if M is None:
+            return frame
+
+    # 4. Smooth the affine matrix across frames for temporal stability
+    alpha = SMOOTH_STATE.get('alpha', 0.45)
+    if SMOOTH_STATE['M'] is None:
+        SmoothedM = M
+    else:
+        SmoothedM = alpha * M + (1.0 - alpha) * SMOOTH_STATE['M']
+
+    SMOOTH_STATE['M'] = SmoothedM
+
+    # 5. Warp glasses BGR and alpha using the smoothed affine transform
+    warped_bgr = cv2.warpAffine(glasses_bgr, SmoothedM, (frame.shape[1], frame.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    warped_alpha = cv2.warpAffine(glasses_alpha, SmoothedM, (frame.shape[1], frame.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+    # 6. Create soft alpha mask (feather edges) and normalize
+    #    Blur kernel size scales with face size for consistent feathering
+    face_width = np.linalg.norm(right_eye_center - left_eye_center)
+    k = int(max(3, min(31, face_width * 0.08)))
+    if k % 2 == 0:
+        k += 1
+
+    alpha_mask = warped_alpha.astype(np.float32) / 255.0
+    alpha_mask = cv2.GaussianBlur(alpha_mask, (k, k), 0)
+
+    # 7. Find tight ROI of non-zero alpha to limit blending work
+    ys, xs = np.where(alpha_mask > 0.01)
+    if ys.size == 0 or xs.size == 0:
+        return frame
+
+    y1, y2 = ys.min(), ys.max()
+    x1, x2 = xs.min(), xs.max()
+
+    # Clip ROI to frame
+    y1 = max(0, y1); x1 = max(0, x1)
+    y2 = min(frame.shape[0]-1, y2); x2 = min(frame.shape[1]-1, x2)
+
+    roi = frame[y1:y2+1, x1:x2+1].astype(np.float32)
+    fg = warped_bgr[y1:y2+1, x1:x2+1].astype(np.float32)
+    a = alpha_mask[y1:y2+1, x1:x2+1][:, :, np.newaxis]
+
+    # 8. Blend using alpha
+    blended = fg * a + roi * (1.0 - a)
+    frame[y1:y2+1, x1:x2+1] = blended.astype(np.uint8)
 
     return frame
 
@@ -142,7 +198,7 @@ def overlay_glasses(frame, landmarks):
 
 def open_webcam():
     # Use camera index 1
-    cap = cv2.VideoCapture(1) 
+    cap = cv2.VideoCapture(0) 
 
     if not cap.isOpened():
         print("Error: Could not open webcam.")
